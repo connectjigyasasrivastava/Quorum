@@ -192,7 +192,6 @@ public class RaftNode {
             commitTracker.updateMatchIndex(peer, resp.matchIndex());
             commitTracker.recomputeCommitIndex(log.lastIndex());
         } else {
-            // Consistency check failed; move this peer's pointer back and retry.
             synchronized (nextIndex) {
                 long current = nextIndex.getOrDefault(peer, peerNext);
                 nextIndex.put(peer, Math.max(0, current - 1));
