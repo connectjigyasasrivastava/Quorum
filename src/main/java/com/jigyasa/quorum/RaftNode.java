@@ -62,6 +62,13 @@ public class RaftNode {
         if (ticker != null) {
             ticker.interrupt();
         }
+        try {
+            if (ticker != null) {
+                ticker.join(200);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
         rpcPool.shutdownNow();
     }
 
@@ -101,24 +108,31 @@ public class RaftNode {
         List<NodeId> peers = config.peers();
 
         for (NodeId peer : peers) {
-            rpcPool.submit(() -> {
-                VoteResponse resp = transport.sendVote(peer, request);
-                if (resp == null) {
-                    return;
-                }
-                if (resp.term() > state.currentTerm()) {
-                    state.advanceTerm(resp.term());
-                    return;
-                }
-                if (resp.voteGranted()) {
-                    int total = votes.incrementAndGet();
-                    if (elections.hasWon(total)
-                            && state.role() == Role.CANDIDATE
-                            && state.currentTerm() == term) {
-                        becomeLeader();
+            if (stopped || rpcPool.isShutdown()) {
+                break;
+            }
+            try {
+                rpcPool.submit(() -> {
+                    VoteResponse resp = transport.sendVote(peer, request);
+                    if (resp == null) {
+                        return;
                     }
-                }
-            });
+                    if (resp.term() > state.currentTerm()) {
+                        state.advanceTerm(resp.term());
+                        return;
+                    }
+                    if (resp.voteGranted()) {
+                        int total = votes.incrementAndGet();
+                        if (elections.hasWon(total)
+                                && state.role() == Role.CANDIDATE
+                                && state.currentTerm() == term) {
+                            becomeLeader();
+                        }
+                    }
+                });
+            } catch (java.util.concurrent.RejectedExecutionException ignored) {
+                break;
+            }
         }
     }
 
@@ -144,9 +158,19 @@ public class RaftNode {
     }
 
     private void replicateToFollowers() {
+        if (stopped) {
+            return;
+        }
         long term = state.currentTerm();
         for (NodeId peer : config.peers()) {
-            rpcPool.submit(() -> replicateToPeer(peer, term));
+            if (stopped || rpcPool.isShutdown()) {
+                return;
+            }
+            try {
+                rpcPool.submit(() -> replicateToPeer(peer, term));
+            } catch (java.util.concurrent.RejectedExecutionException ignored) {
+                return; // pool shutting down during teardown; safe to stop
+            }
         }
     }
 
