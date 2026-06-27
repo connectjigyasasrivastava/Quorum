@@ -1,5 +1,6 @@
 package com.jigyasa.quorum;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -28,6 +29,7 @@ public class RaftNode {
     private final AtomicLong lastContact = new AtomicLong(System.currentTimeMillis());
     private volatile long currentTimeoutMs = randomTimeout();
     private volatile boolean stopped = false;
+    private volatile long lastHeartbeat = 0;
 
     private Thread ticker;
 
@@ -73,6 +75,11 @@ public class RaftNode {
             }
 
             if (state.role() == Role.LEADER) {
+                long now = System.currentTimeMillis();
+                if (now - lastHeartbeat >= HEARTBEAT_INTERVAL_MS) {
+                    lastHeartbeat = now;
+                    replicateToFollowers();
+                }
                 continue;
             }
 
@@ -124,6 +131,78 @@ public class RaftNode {
                 nextIndex.put(peer, nextIdx);
             }
         }
+        lastHeartbeat = 0;
+    }
+
+    // Leader path: append a client write locally, to be replicated next tick.
+    // Returns the index it was stored at, or -1 if this node is not leader.
+    public long appendClientEntry(String topic, byte[] payload) {
+        if (state.role() != Role.LEADER) {
+            return -1;
+        }
+        return log.appendOnLeader(state.currentTerm(), topic, payload);
+    }
+
+    private void replicateToFollowers() {
+        long term = state.currentTerm();
+        for (NodeId peer : config.peers()) {
+            rpcPool.submit(() -> replicateToPeer(peer, term));
+        }
+    }
+
+    private void replicateToPeer(NodeId peer, long term) {
+        long peerNext;
+        synchronized (nextIndex) {
+            peerNext = nextIndex.getOrDefault(peer, log.lastIndex() + 1);
+        }
+
+        long prevIndex = peerNext - 1;
+        long prevTerm = prevIndex >= 0 ? entryTermAt(prevIndex) : 0;
+
+        List<LogEntry> batch = new ArrayList<>();
+        long lastIdx = log.lastIndex();
+        for (long i = peerNext; i <= lastIdx; i++) {
+            LogEntry e = log.get(i);
+            if (e != null) {
+                batch.add(e);
+            }
+        }
+
+        ReplicationRequest request = new ReplicationRequest(
+                term, config.self(), prevIndex, prevTerm, batch, commitTracker.commitIndex());
+
+        ReplicationResponse resp = transport.sendAppend(peer, request);
+        if (resp == null) {
+            return;
+        }
+
+        if (resp.term() > state.currentTerm()) {
+            state.advanceTerm(resp.term());
+            return;
+        }
+
+        if (state.role() != Role.LEADER || state.currentTerm() != term) {
+            return;
+        }
+
+        if (resp.success()) {
+            synchronized (nextIndex) {
+                nextIndex.put(peer, resp.matchIndex() + 1);
+            }
+            commitTracker.updateMatchIndex(peer, resp.matchIndex());
+            commitTracker.recomputeCommitIndex(log.lastIndex());
+        } else {
+            // Consistency check failed; move this peer's pointer back and retry.
+            synchronized (nextIndex) {
+                long current = nextIndex.getOrDefault(peer, peerNext);
+                nextIndex.put(peer, Math.max(0, current - 1));
+            }
+        }
+    }
+
+    private long entryTermAt(long index) {
+        LogEntry e = log.get(index);
+        return e == null ? 0 : e.term();
     }
 
     public VoteResponse onVoteRequest(VoteRequest request) {
