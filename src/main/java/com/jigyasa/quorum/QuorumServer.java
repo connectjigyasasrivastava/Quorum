@@ -8,38 +8,49 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-/**
- * A TCP server that exposes the message queue over the network.
- *
- * Each client connection is handled on its own thread. Each request is
- * one line of text; each response is one line of text (see Protocol).
- */
 public class QuorumServer implements AutoCloseable {
 
     private final int port;
     private final RequestHandler handler;
+    private final RaftNode raft;
     private final ExecutorService clientPool;
     private ServerSocket serverSocket;
     private volatile boolean running;
 
+    // Phase 1-3 server: standalone queue, no replication.
     public QuorumServer(int port, Path dataDir) throws IOException {
         this.port = port;
         PersistentMessageQueue queue = new PersistentMessageQueue(dataDir);
+        this.raft = null;
         this.handler = new RequestHandler(queue);
         this.clientPool = Executors.newCachedThreadPool();
     }
 
-    /**
-     * Starts listening. Blocks the calling thread accepting connections
-     * until close() is called.
-     */
+    // Phase 4 server: replicated. self is this node, peers are the others.
+    public QuorumServer(int port, Path dataDir, NodeId self, List<NodeId> peers) throws IOException {
+        this.port = port;
+        PersistentMessageQueue queue = new PersistentMessageQueue(dataDir);
+        ClusterConfig config = new ClusterConfig(self, peers);
+        ReplicatedLog log = new ReplicatedLog();
+        RaftTransport transport = new RaftTransport();
+        this.raft = new RaftNode(config, log, transport);
+        this.handler = new RequestHandler(queue, raft);
+        this.clientPool = Executors.newCachedThreadPool();
+    }
+
     public void start() throws IOException {
         serverSocket = new ServerSocket(port);
         running = true;
         System.out.println("Quorum server listening on port " + port);
+
+        if (raft != null) {
+            raft.start();
+            System.out.println("Raft node started: " + raft.id());
+        }
 
         while (running) {
             try {
@@ -74,9 +85,16 @@ public class QuorumServer implements AutoCloseable {
         return serverSocket != null ? serverSocket.getLocalPort() : port;
     }
 
+    public RaftNode raft() {
+        return raft;
+    }
+
     @Override
     public void close() throws IOException {
         running = false;
+        if (raft != null) {
+            raft.stop();
+        }
         if (serverSocket != null) {
             serverSocket.close();
         }
